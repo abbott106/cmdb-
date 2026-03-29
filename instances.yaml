@@ -1,0 +1,19 @@
+# instances.yaml
+# Point this at your Aria Operations node — NOT vCenter.
+# One Aria instance can cover all the vCenters it monitors.
+
+instances:
+  - name: "aria-prod"
+    hostname: "aria-ops.company.local"     # Aria Operations FQDN or IP
+    username: "admin"                       # Aria Operations local admin user
+    password_env: "ARIA_PASSWORD"           # reads from .env
+    auth_source: "LOCAL"                    # LOCAL, LDAP, or AD depending on your setup
+    verify_ssl: true                        # set false if using self-signed cert
+
+  # If you have a second Aria instance (e.g. DR site), add it here:
+  # - name: "aria-dr"
+  #   hostname: "aria-ops-dr.company.local"
+  #   username: "admin"
+  #   password_env: "ARIA_DR_PASSWORD"
+  #   auth_source: "LOCAL"
+  #   verify_ssl: true
