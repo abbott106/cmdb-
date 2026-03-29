@@ -1,0 +1,21 @@
+[postgres] | Error: in 18+, these Docker images are configured to store database data in a
+[postgres] |        format which is compatible with "pg_ctlcluster" (specifically, using
+[postgres] |        major-version-specific directory names).  This better reflects how
+[postgres] |        PostgreSQL itself works, and how upgrades are to be performed.
+[postgres] |
+[postgres] |        See also https://github.com/docker-library/postgres/pull/1259
+[postgres] |
+[postgres] |        Counter to that, there appears to be PostgreSQL data in:
+[postgres] |          /var/lib/postgresql/data (unused mount/volume)
+[postgres] |
+[postgres] |        This is usually the result of upgrading the Docker image without
+[postgres] |        upgrading the underlying database using "pg_upgrade" (which requires both
+[postgres] |        versions).
+[postgres] |
+[postgres] |        The suggested container configuration for 18+ is to place a single mount
+[postgres] |        at /var/lib/postgresql which will then place PostgreSQL data in a
+[postgres] |        subdirectory, allowing usage of "pg_upgrade --link" without mount point
+[postgres] |        boundary issues.
+[postgres] |
+[postgres] |        See https://github.com/docker-library/postgres/issues/37 for a (long)
+[postgres] |        discussion around this process, and suggestions for how to do so.
