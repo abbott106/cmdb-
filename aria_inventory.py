@@ -1,6 +1,9 @@
 """
-VMware Aria Inventory Collector
-Queries multiple vSphere/Aria instances and populates a PostgreSQL database.
+VMware Aria Operations Inventory Collector
+Queries Aria Operations (vRealize Operations) API and populates a PostgreSQL database.
+
+Aria Operations already monitors all your vCenters — this script queries Aria once
+and pulls inventory across every vCenter Aria knows about.
 
 Requirements:
     pip install requests psycopg2-binary python-dotenv pyyaml
@@ -15,11 +18,10 @@ import logging
 import yaml
 import requests
 import psycopg2
-from psycopg2.extras import execute_values
 from datetime import datetime
 from dotenv import load_dotenv
 
-# ── Logging ──────────────────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -30,12 +32,21 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-load_dotenv()  # Load credentials from .env file
+load_dotenv()
+
+# ── Aria Operations Resource Kind Constants ───────────────────────────────────
+ADAPTER_KIND   = "VMWARE"
+KIND_VCENTER   = "VMwareAdapter Instance"
+KIND_DC        = "Datacenter"
+KIND_CLUSTER   = "ClusterComputeResource"
+KIND_HOST      = "HostSystem"
+KIND_VM        = "VirtualMachine"
+KIND_DATASTORE = "Datastore"
+KIND_NETWORK   = "DistributedVirtualPortgroup"
 
 
 # ── Database Connection ───────────────────────────────────────────────────────
 def get_db_connection():
-    """Create and return a PostgreSQL connection."""
     return psycopg2.connect(
         host=os.getenv("DB_HOST", "localhost"),
         port=os.getenv("DB_PORT", "5432"),
@@ -46,87 +57,89 @@ def get_db_connection():
 
 
 def init_database(conn):
-    """Create tables if they don't already exist."""
+    """Create all tables if they don't exist."""
     ddl = """
-    -- vSphere instances being monitored
-    CREATE TABLE IF NOT EXISTS vsphere_instances (
+    CREATE TABLE IF NOT EXISTS aria_instances (
         id          SERIAL PRIMARY KEY,
         name        VARCHAR(255) NOT NULL UNIQUE,
         hostname    VARCHAR(255) NOT NULL,
         last_synced TIMESTAMPTZ
     );
 
-    -- Datacenters within each instance
+    CREATE TABLE IF NOT EXISTS vcenters (
+        id          SERIAL PRIMARY KEY,
+        aria_id     INTEGER REFERENCES aria_instances(id) ON DELETE CASCADE,
+        name        VARCHAR(255),
+        aria_uuid   VARCHAR(255) UNIQUE,
+        version     VARCHAR(64),
+        last_synced TIMESTAMPTZ
+    );
+
     CREATE TABLE IF NOT EXISTS datacenters (
         id          SERIAL PRIMARY KEY,
-        instance_id INTEGER REFERENCES vsphere_instances(id) ON DELETE CASCADE,
-        name        VARCHAR(255) NOT NULL,
-        moref       VARCHAR(255),
-        UNIQUE (instance_id, moref)
+        vcenter_id  INTEGER REFERENCES vcenters(id) ON DELETE CASCADE,
+        name        VARCHAR(255),
+        aria_uuid   VARCHAR(255) UNIQUE
     );
 
-    -- Clusters within each datacenter
     CREATE TABLE IF NOT EXISTS clusters (
-        id            SERIAL PRIMARY KEY,
-        datacenter_id INTEGER REFERENCES datacenters(id) ON DELETE CASCADE,
-        name          VARCHAR(255) NOT NULL,
-        moref         VARCHAR(255),
-        total_cpu     INTEGER,
-        total_memory_gb NUMERIC(10,2),
-        UNIQUE (datacenter_id, moref)
+        id               SERIAL PRIMARY KEY,
+        datacenter_id    INTEGER REFERENCES datacenters(id) ON DELETE CASCADE,
+        name             VARCHAR(255),
+        aria_uuid        VARCHAR(255) UNIQUE,
+        num_hosts        INTEGER,
+        health_state     VARCHAR(64)
     );
 
-    -- ESXi Hosts
     CREATE TABLE IF NOT EXISTS hosts (
-        id              SERIAL PRIMARY KEY,
-        cluster_id      INTEGER REFERENCES clusters(id) ON DELETE CASCADE,
-        name            VARCHAR(255) NOT NULL,
-        ip_address      VARCHAR(64),
-        cpu_cores       INTEGER,
-        memory_gb       NUMERIC(10,2),
+        id               SERIAL PRIMARY KEY,
+        cluster_id       INTEGER REFERENCES clusters(id) ON DELETE CASCADE,
+        name             VARCHAR(255),
+        aria_uuid        VARCHAR(255) UNIQUE,
+        cpu_cores        INTEGER,
+        memory_gb        NUMERIC(10,2),
         connection_state VARCHAR(64),
-        power_state     VARCHAR(64),
-        moref           VARCHAR(255),
-        UNIQUE (cluster_id, moref)
+        power_state      VARCHAR(64),
+        health_state     VARCHAR(64),
+        version          VARCHAR(64),
+        num_vms          INTEGER
     );
 
-    -- Virtual Machines
     CREATE TABLE IF NOT EXISTS vms (
         id             SERIAL PRIMARY KEY,
         host_id        INTEGER REFERENCES hosts(id) ON DELETE CASCADE,
-        name           VARCHAR(255) NOT NULL,
+        name           VARCHAR(255),
+        aria_uuid      VARCHAR(255) UNIQUE,
         power_state    VARCHAR(64),
         guest_os       VARCHAR(255),
         cpu_count      INTEGER,
         memory_gb      NUMERIC(10,2),
         ip_address     VARCHAR(64),
         dns_name       VARCHAR(255),
-        moref          VARCHAR(255),
+        storage_gb     NUMERIC(12,2),
         num_disks      INTEGER,
-        storage_gb     NUMERIC(10,2),
-        UNIQUE (host_id, moref)
+        snapshot_count INTEGER,
+        health_state   VARCHAR(64)
     );
 
-    -- Datastores
     CREATE TABLE IF NOT EXISTS datastores (
         id           SERIAL PRIMARY KEY,
-        instance_id  INTEGER REFERENCES vsphere_instances(id) ON DELETE CASCADE,
-        name         VARCHAR(255) NOT NULL,
+        vcenter_id   INTEGER REFERENCES vcenters(id) ON DELETE CASCADE,
+        name         VARCHAR(255),
+        aria_uuid    VARCHAR(255) UNIQUE,
         type         VARCHAR(64),
         capacity_gb  NUMERIC(12,2),
         free_gb      NUMERIC(12,2),
-        moref        VARCHAR(255),
-        UNIQUE (instance_id, moref)
+        health_state VARCHAR(64)
     );
 
-    -- Networks
     CREATE TABLE IF NOT EXISTS networks (
-        id          SERIAL PRIMARY KEY,
-        instance_id INTEGER REFERENCES vsphere_instances(id) ON DELETE CASCADE,
-        name        VARCHAR(255) NOT NULL,
-        type        VARCHAR(64),
-        moref       VARCHAR(255),
-        UNIQUE (instance_id, moref)
+        id           SERIAL PRIMARY KEY,
+        vcenter_id   INTEGER REFERENCES vcenters(id) ON DELETE CASCADE,
+        name         VARCHAR(255),
+        aria_uuid    VARCHAR(255) UNIQUE,
+        type         VARCHAR(64),
+        vlan_id      VARCHAR(64)
     );
     """
     with conn.cursor() as cur:
@@ -135,352 +148,491 @@ def init_database(conn):
     log.info("Database schema initialized.")
 
 
-# ── Aria / vSphere API Client ─────────────────────────────────────────────────
-class AriaClient:
-    """Thin REST client for VMware Aria Operations + vSphere REST API."""
+# ── Aria Operations API Client ────────────────────────────────────────────────
+class AriaOpsClient:
+    """
+    Client for the VMware Aria Operations REST API.
+    API base: https://<aria-hostname>/suite-api/api/
+    """
 
-    def __init__(self, hostname: str, username: str, password: str, verify_ssl: bool = True):
-        self.base_aria = f"https://{hostname}/suite-api/api"
-        self.base_vsphere = f"https://{hostname}/api"
+    def __init__(self, hostname: str, username: str, password: str,
+                 auth_source: str = "LOCAL", verify_ssl: bool = True):
+        self.base = f"https://{hostname}/suite-api/api"
+        self.hostname = hostname
         self.username = username
         self.password = password
+        self.auth_source = auth_source
         self.verify_ssl = verify_ssl
         self.session = requests.Session()
         self.session.verify = verify_ssl
-        self.token = None
-
+        self.session.headers.update({
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        })
         if not verify_ssl:
             import urllib3
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-    # ── Authentication ──────────────────────────────────────────────────────
-
     def authenticate(self):
-        """Acquire an Aria Operations auth token."""
-        url = f"{self.base_aria}/auth/token/acquire"
+        """Acquire Aria Operations auth token via /suite-api/api/auth/token/acquire."""
+        url = f"{self.base}/auth/token/acquire"
         payload = {
             "username": self.username,
             "password": self.password,
-            "authSource": "LOCAL",
+            "authSource": self.auth_source,
         }
         resp = self.session.post(url, json=payload, timeout=30)
         resp.raise_for_status()
-        self.token = resp.json().get("token")
-        self.session.headers.update({
-            "Authorization": f"vRealizeOpsToken {self.token}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        })
-        log.info(f"Authenticated to Aria on {self.base_aria}")
+        token = resp.json().get("token")
+        if not token:
+            raise ValueError("No token returned — check credentials and authSource")
+        self.session.headers.update({"Authorization": f"vRealizeOpsToken {token}"})
+        log.info(f"Authenticated to Aria Operations: {self.hostname}")
 
-    def authenticate_vsphere(self):
-        """Acquire a vSphere REST API session token."""
-        url = f"{self.base_vsphere}/session"
-        resp = self.session.post(url, auth=(self.username, self.password), timeout=30)
-        resp.raise_for_status()
-        vsphere_token = resp.json()
-        self.session.headers.update({"vmware-api-session-id": vsphere_token})
-        log.info("Authenticated to vSphere REST API.")
+    def release_token(self):
+        try:
+            self.session.post(f"{self.base}/auth/token/release", timeout=10)
+        except Exception:
+            pass
 
-    # ── Paginated GET helper ────────────────────────────────────────────────
+    # ── Paginated resource fetcher ────────────────────────────────────────────
 
-    def _paginate_aria(self, endpoint: str, result_key: str, page_size: int = 1000) -> list:
-        """Fetch all pages from an Aria Operations list endpoint."""
-        results = []
+    def get_resources(self, resource_kind: str, adapter_kind: str = ADAPTER_KIND,
+                      page_size: int = 1000) -> list:
+        """Fetch all resources of a given kind, handling pagination."""
+        resources = []
         page = 0
+        url = f"{self.base}/resources"
         while True:
-            url = f"{self.base_aria}/{endpoint}"
-            params = {"pageSize": page_size, "page": page}
+            params = {
+                "adapterKind": adapter_kind,
+                "resourceKind": resource_kind,
+                "pageSize": page_size,
+                "page": page,
+            }
             resp = self.session.get(url, params=params, timeout=60)
             resp.raise_for_status()
             data = resp.json()
-            items = data.get(result_key, [])
-            results.extend(items)
-            if len(items) < page_size:
+            items = data.get("resourceList", [])
+            resources.extend(items)
+            total = data.get("pageInfo", {}).get("totalCount", 0)
+            if len(resources) >= total or len(items) < page_size:
                 break
             page += 1
-        return results
+        log.info(f"  {resource_kind}: {len(resources)} found")
+        return resources
 
-    def _get_vsphere(self, endpoint: str, params: dict = None) -> list:
-        """GET from the vSphere REST API (handles simple lists)."""
-        url = f"{self.base_vsphere}/{endpoint}"
-        resp = self.session.get(url, params=params or {}, timeout=60)
-        resp.raise_for_status()
-        return resp.json()
+    # ── Property fetcher ──────────────────────────────────────────────────────
 
-    # ── Resource collectors ─────────────────────────────────────────────────
-
-    def get_datacenters(self) -> list:
-        """Fetch all datacenters via vSphere REST API."""
-        raw = self._get_vsphere("vcenter/datacenter")
-        return [
-            {
-                "name": dc.get("name"),
-                "moref": dc.get("datacenter"),
+    def get_properties(self, resource_uuid: str, prop_keys: list) -> dict:
+        """Fetch named properties for a resource. Returns {key: value}."""
+        url = f"{self.base}/resources/{resource_uuid}/properties"
+        try:
+            resp = self.session.get(url, timeout=30)
+            resp.raise_for_status()
+            return {
+                p["name"]: p.get("value")
+                for p in resp.json().get("property", [])
+                if p.get("name") in prop_keys
             }
-            for dc in raw
-        ]
+        except Exception as e:
+            log.debug(f"    Properties fetch failed for {resource_uuid}: {e}")
+            return {}
 
-    def get_clusters(self, datacenter_moref: str) -> list:
-        """Fetch clusters in a given datacenter."""
-        raw = self._get_vsphere("vcenter/cluster", {"datacenters": datacenter_moref})
-        return [
-            {
-                "name": c.get("name"),
-                "moref": c.get("cluster"),
-            }
-            for c in raw
-        ]
+    # ── Parent relationship lookup ────────────────────────────────────────────
 
-    def get_hosts(self, cluster_moref: str) -> list:
-        """Fetch hosts in a given cluster."""
-        raw = self._get_vsphere("vcenter/host", {"clusters": cluster_moref})
-        return [
-            {
-                "name": h.get("name"),
-                "moref": h.get("host"),
-                "connection_state": h.get("connection_state"),
-                "power_state": h.get("power_state"),
-            }
-            for h in raw
-        ]
+    def get_parent_uuid(self, resource_uuid: str, parent_kind: str) -> str:
+        """Return the UUID of the nearest parent of a given resourceKind."""
+        url = f"{self.base}/resources/{resource_uuid}/relationships/parents"
+        try:
+            resp = self.session.get(url, params={"resourceKind": parent_kind}, timeout=30)
+            resp.raise_for_status()
+            items = resp.json().get("resourceList", [])
+            if items:
+                return items[0].get("identifier")
+        except Exception:
+            pass
+        return None
 
-    def get_vms(self, host_moref: str) -> list:
-        """Fetch VMs on a given host."""
-        raw = self._get_vsphere("vcenter/vm", {"hosts": host_moref})
-        vms = []
-        for vm in raw:
-            vms.append({
-                "name": vm.get("name"),
-                "moref": vm.get("vm"),
-                "power_state": vm.get("power_state"),
-                "cpu_count": vm.get("cpu_count"),
-                "memory_gb": round(vm.get("memory_size_MiB", 0) / 1024, 2) if vm.get("memory_size_MiB") else None,
-                "guest_os": vm.get("guest_OS"),
+    # ── High-level collectors ─────────────────────────────────────────────────
+
+    def collect_vcenters(self) -> list:
+        raw = self.get_resources(KIND_VCENTER)
+        result = []
+        for r in raw:
+            uuid = r.get("identifier")
+            props = self.get_properties(uuid, ["summary|version"])
+            result.append({
+                "aria_uuid": uuid,
+                "name": r.get("resourceKey", {}).get("name"),
+                "health_state": _health(r),
+                "version": props.get("summary|version"),
             })
-        return vms
+        return result
 
-    def get_datastores(self) -> list:
-        """Fetch all datastores."""
-        raw = self._get_vsphere("vcenter/datastore")
-        return [
-            {
-                "name": ds.get("name"),
-                "moref": ds.get("datastore"),
-                "type": ds.get("type"),
-                "capacity_gb": round(ds.get("capacity", 0) / (1024 ** 3), 2) if ds.get("capacity") else None,
-                "free_gb": round(ds.get("free_space", 0) / (1024 ** 3), 2) if ds.get("free_space") else None,
-            }
-            for ds in raw
-        ]
+    def collect_datacenters(self) -> list:
+        raw = self.get_resources(KIND_DC)
+        return [{
+            "aria_uuid": r.get("identifier"),
+            "name": r.get("resourceKey", {}).get("name"),
+            "parent_vcenter_uuid": self.get_parent_uuid(r.get("identifier"), KIND_VCENTER),
+        } for r in raw]
 
-    def get_networks(self) -> list:
-        """Fetch all networks."""
-        raw = self._get_vsphere("vcenter/network")
-        return [
-            {
-                "name": n.get("name"),
-                "moref": n.get("network"),
-                "type": n.get("type"),
-            }
-            for n in raw
-        ]
+    def collect_clusters(self) -> list:
+        raw = self.get_resources(KIND_CLUSTER)
+        result = []
+        for r in raw:
+            uuid = r.get("identifier")
+            props = self.get_properties(uuid, ["summary|number_hosts"])
+            result.append({
+                "aria_uuid": uuid,
+                "name": r.get("resourceKey", {}).get("name"),
+                "health_state": _health(r),
+                "num_hosts": _safe_int(props.get("summary|number_hosts")),
+                "parent_dc_uuid": self.get_parent_uuid(uuid, KIND_DC),
+            })
+        return result
+
+    def collect_hosts(self) -> list:
+        raw = self.get_resources(KIND_HOST)
+        result = []
+        for r in raw:
+            uuid = r.get("identifier")
+            props = self.get_properties(uuid, [
+                "summary|runtime|powerState",
+                "summary|runtime|connectionState",
+                "summary|hardware|numCpuCores",
+                "summary|hardware|memorySize",
+                "summary|config|product|version",
+                "summary|number_running_vms",
+            ])
+            result.append({
+                "aria_uuid": uuid,
+                "name": r.get("resourceKey", {}).get("name"),
+                "health_state": _health(r),
+                "power_state": props.get("summary|runtime|powerState"),
+                "connection_state": props.get("summary|runtime|connectionState"),
+                "cpu_cores": _safe_int(props.get("summary|hardware|numCpuCores")),
+                "memory_gb": _safe_gb(props.get("summary|hardware|memorySize"), "bytes"),
+                "version": props.get("summary|config|product|version"),
+                "num_vms": _safe_int(props.get("summary|number_running_vms")),
+                "parent_cluster_uuid": self.get_parent_uuid(uuid, KIND_CLUSTER),
+            })
+        return result
+
+    def collect_vms(self) -> list:
+        raw = self.get_resources(KIND_VM)
+        result = []
+        for r in raw:
+            uuid = r.get("identifier")
+            props = self.get_properties(uuid, [
+                "summary|runtime|powerState",
+                "config|guestFullName",
+                "config|hardware|numCpu",
+                "config|hardware|memoryKB",
+                "summary|guest|ipAddress",
+                "summary|guest|hostName",
+                "summary|storage|committed",
+                "config|hardware|numVirtualDisks",
+                "snapshot|count",
+            ])
+            result.append({
+                "aria_uuid": uuid,
+                "name": r.get("resourceKey", {}).get("name"),
+                "health_state": _health(r),
+                "power_state": props.get("summary|runtime|powerState"),
+                "guest_os": props.get("config|guestFullName"),
+                "cpu_count": _safe_int(props.get("config|hardware|numCpu")),
+                "memory_gb": _safe_gb(props.get("config|hardware|memoryKB"), "kb"),
+                "ip_address": props.get("summary|guest|ipAddress"),
+                "dns_name": props.get("summary|guest|hostName"),
+                "storage_gb": _safe_gb(props.get("summary|storage|committed"), "bytes"),
+                "num_disks": _safe_int(props.get("config|hardware|numVirtualDisks")),
+                "snapshot_count": _safe_int(props.get("snapshot|count")),
+                "parent_host_uuid": self.get_parent_uuid(uuid, KIND_HOST),
+            })
+        return result
+
+    def collect_datastores(self) -> list:
+        raw = self.get_resources(KIND_DATASTORE)
+        result = []
+        for r in raw:
+            uuid = r.get("identifier")
+            props = self.get_properties(uuid, [
+                "summary|type",
+                "summary|capacity",
+                "summary|freeSpace",
+            ])
+            result.append({
+                "aria_uuid": uuid,
+                "name": r.get("resourceKey", {}).get("name"),
+                "health_state": _health(r),
+                "type": props.get("summary|type"),
+                "capacity_gb": _safe_gb(props.get("summary|capacity"), "bytes"),
+                "free_gb": _safe_gb(props.get("summary|freeSpace"), "bytes"),
+                "parent_vcenter_uuid": self.get_parent_uuid(uuid, KIND_VCENTER),
+            })
+        return result
+
+    def collect_networks(self) -> list:
+        raw = self.get_resources(KIND_NETWORK)
+        result = []
+        for r in raw:
+            uuid = r.get("identifier")
+            props = self.get_properties(uuid, [
+                "summary|type",
+                "config|defaultPortConfig|vlan|vlanId",
+            ])
+            result.append({
+                "aria_uuid": uuid,
+                "name": r.get("resourceKey", {}).get("name"),
+                "type": props.get("summary|type"),
+                "vlan_id": props.get("config|defaultPortConfig|vlan|vlanId"),
+                "parent_vcenter_uuid": self.get_parent_uuid(uuid, KIND_VCENTER),
+            })
+        return result
 
 
-# ── Database Upsert Helpers ───────────────────────────────────────────────────
+# ── Utility helpers ───────────────────────────────────────────────────────────
 
-def upsert_instance(conn, name: str, hostname: str) -> int:
+def _health(resource: dict) -> str:
+    states = resource.get("resourceStatusStates", [{}])
+    return states[0].get("healthState", "UNKNOWN") if states else "UNKNOWN"
+
+def _safe_int(val) -> int:
+    try:
+        return int(float(val)) if val is not None else None
+    except (ValueError, TypeError):
+        return None
+
+def _safe_gb(val, unit="bytes") -> float:
+    try:
+        v = float(val)
+        if unit == "bytes": return round(v / (1024 ** 3), 2)
+        if unit == "kb":    return round(v / (1024 ** 2), 2)
+        if unit == "mb":    return round(v / 1024, 2)
+        return round(v, 2)
+    except (ValueError, TypeError):
+        return None
+
+
+# ── Database upserts ──────────────────────────────────────────────────────────
+
+def upsert_aria_instance(conn, name, hostname):
     with conn.cursor() as cur:
         cur.execute("""
-            INSERT INTO vsphere_instances (name, hostname)
+            INSERT INTO aria_instances (name, hostname)
             VALUES (%s, %s)
             ON CONFLICT (name) DO UPDATE SET hostname = EXCLUDED.hostname
             RETURNING id
         """, (name, hostname))
         return cur.fetchone()[0]
 
-
-def update_last_synced(conn, instance_id: int):
-    with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE vsphere_instances SET last_synced = %s WHERE id = %s",
-            (datetime.utcnow(), instance_id),
-        )
-
-
-def upsert_datacenter(conn, instance_id: int, dc: dict) -> int:
+def upsert_vcenter(conn, aria_id, vc):
     with conn.cursor() as cur:
         cur.execute("""
-            INSERT INTO datacenters (instance_id, name, moref)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (instance_id, moref) DO UPDATE SET name = EXCLUDED.name
-            RETURNING id
-        """, (instance_id, dc["name"], dc["moref"]))
-        return cur.fetchone()[0]
-
-
-def upsert_cluster(conn, datacenter_id: int, cluster: dict) -> int:
-    with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO clusters (datacenter_id, name, moref)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (datacenter_id, moref) DO UPDATE SET name = EXCLUDED.name
-            RETURNING id
-        """, (datacenter_id, cluster["name"], cluster["moref"]))
-        return cur.fetchone()[0]
-
-
-def upsert_host(conn, cluster_id: int, host: dict) -> int:
-    with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO hosts (cluster_id, name, moref, connection_state, power_state)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (cluster_id, moref) DO UPDATE SET
-                name = EXCLUDED.name,
-                connection_state = EXCLUDED.connection_state,
-                power_state = EXCLUDED.power_state
-            RETURNING id
-        """, (cluster_id, host["name"], host["moref"],
-              host.get("connection_state"), host.get("power_state")))
-        return cur.fetchone()[0]
-
-
-def upsert_vm(conn, host_id: int, vm: dict):
-    with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO vms (host_id, name, moref, power_state, cpu_count, memory_gb, guest_os)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (host_id, moref) DO UPDATE SET
-                name        = EXCLUDED.name,
-                power_state = EXCLUDED.power_state,
-                cpu_count   = EXCLUDED.cpu_count,
-                memory_gb   = EXCLUDED.memory_gb,
-                guest_os    = EXCLUDED.guest_os
-        """, (host_id, vm["name"], vm["moref"], vm.get("power_state"),
-              vm.get("cpu_count"), vm.get("memory_gb"), vm.get("guest_os")))
-
-
-def upsert_datastore(conn, instance_id: int, ds: dict):
-    with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO datastores (instance_id, name, moref, type, capacity_gb, free_gb)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            ON CONFLICT (instance_id, moref) DO UPDATE SET
-                name        = EXCLUDED.name,
-                type        = EXCLUDED.type,
-                capacity_gb = EXCLUDED.capacity_gb,
-                free_gb     = EXCLUDED.free_gb
-        """, (instance_id, ds["name"], ds["moref"], ds.get("type"),
-              ds.get("capacity_gb"), ds.get("free_gb")))
-
-
-def upsert_network(conn, instance_id: int, net: dict):
-    with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO networks (instance_id, name, moref, type)
+            INSERT INTO vcenters (aria_id, name, aria_uuid, version)
             VALUES (%s, %s, %s, %s)
-            ON CONFLICT (instance_id, moref) DO UPDATE SET
-                name = EXCLUDED.name,
-                type = EXCLUDED.type
-        """, (instance_id, net["name"], net["moref"], net.get("type")))
+            ON CONFLICT (aria_uuid) DO UPDATE SET
+                name = EXCLUDED.name, version = EXCLUDED.version
+            RETURNING id
+        """, (aria_id, vc["name"], vc["aria_uuid"], vc.get("version")))
+        return cur.fetchone()[0]
+
+def upsert_datacenter(conn, vcenter_id, dc):
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO datacenters (vcenter_id, name, aria_uuid)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (aria_uuid) DO UPDATE SET name = EXCLUDED.name
+            RETURNING id
+        """, (vcenter_id, dc["name"], dc["aria_uuid"]))
+        return cur.fetchone()[0]
+
+def upsert_cluster(conn, datacenter_id, cluster):
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO clusters (datacenter_id, name, aria_uuid, num_hosts, health_state)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (aria_uuid) DO UPDATE SET
+                name = EXCLUDED.name, num_hosts = EXCLUDED.num_hosts,
+                health_state = EXCLUDED.health_state
+            RETURNING id
+        """, (datacenter_id, cluster["name"], cluster["aria_uuid"],
+              cluster.get("num_hosts"), cluster.get("health_state")))
+        return cur.fetchone()[0]
+
+def upsert_host(conn, cluster_id, host):
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO hosts
+                (cluster_id, name, aria_uuid, cpu_cores, memory_gb,
+                 connection_state, power_state, health_state, version, num_vms)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (aria_uuid) DO UPDATE SET
+                name = EXCLUDED.name, cpu_cores = EXCLUDED.cpu_cores,
+                memory_gb = EXCLUDED.memory_gb,
+                connection_state = EXCLUDED.connection_state,
+                power_state = EXCLUDED.power_state,
+                health_state = EXCLUDED.health_state,
+                version = EXCLUDED.version, num_vms = EXCLUDED.num_vms
+            RETURNING id
+        """, (cluster_id, host["name"], host["aria_uuid"],
+              host.get("cpu_cores"), host.get("memory_gb"),
+              host.get("connection_state"), host.get("power_state"),
+              host.get("health_state"), host.get("version"), host.get("num_vms")))
+        return cur.fetchone()[0]
+
+def upsert_vm(conn, host_id, vm):
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO vms
+                (host_id, name, aria_uuid, power_state, guest_os, cpu_count,
+                 memory_gb, ip_address, dns_name, storage_gb, num_disks,
+                 snapshot_count, health_state)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (aria_uuid) DO UPDATE SET
+                name = EXCLUDED.name, power_state = EXCLUDED.power_state,
+                guest_os = EXCLUDED.guest_os, cpu_count = EXCLUDED.cpu_count,
+                memory_gb = EXCLUDED.memory_gb, ip_address = EXCLUDED.ip_address,
+                dns_name = EXCLUDED.dns_name, storage_gb = EXCLUDED.storage_gb,
+                num_disks = EXCLUDED.num_disks,
+                snapshot_count = EXCLUDED.snapshot_count,
+                health_state = EXCLUDED.health_state
+        """, (host_id, vm["name"], vm["aria_uuid"], vm.get("power_state"),
+              vm.get("guest_os"), vm.get("cpu_count"), vm.get("memory_gb"),
+              vm.get("ip_address"), vm.get("dns_name"), vm.get("storage_gb"),
+              vm.get("num_disks"), vm.get("snapshot_count"), vm.get("health_state")))
+
+def upsert_datastore(conn, vcenter_id, ds):
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO datastores
+                (vcenter_id, name, aria_uuid, type, capacity_gb, free_gb, health_state)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (aria_uuid) DO UPDATE SET
+                name = EXCLUDED.name, type = EXCLUDED.type,
+                capacity_gb = EXCLUDED.capacity_gb, free_gb = EXCLUDED.free_gb,
+                health_state = EXCLUDED.health_state
+        """, (vcenter_id, ds["name"], ds["aria_uuid"], ds.get("type"),
+              ds.get("capacity_gb"), ds.get("free_gb"), ds.get("health_state")))
+
+def upsert_network(conn, vcenter_id, net):
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO networks (vcenter_id, name, aria_uuid, type, vlan_id)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (aria_uuid) DO UPDATE SET
+                name = EXCLUDED.name, type = EXCLUDED.type,
+                vlan_id = EXCLUDED.vlan_id
+        """, (vcenter_id, net["name"], net["aria_uuid"],
+              net.get("type"), net.get("vlan_id")))
 
 
-# ── Main Collection Loop ──────────────────────────────────────────────────────
+# ── Main collection loop ──────────────────────────────────────────────────────
 
 def collect_instance(conn, instance_cfg: dict):
-    """Run a full inventory collection for one vSphere instance."""
-    name = instance_cfg["name"]
-    hostname = instance_cfg["hostname"]
-    username = instance_cfg["username"]
-    password = instance_cfg.get("password") or os.getenv(instance_cfg.get("password_env", ""))
+    name       = instance_cfg["name"]
+    hostname   = instance_cfg["hostname"]
+    username   = instance_cfg["username"]
+    password   = instance_cfg.get("password") or os.getenv(instance_cfg.get("password_env", ""))
+    auth_src   = instance_cfg.get("auth_source", "LOCAL")
     verify_ssl = instance_cfg.get("verify_ssl", True)
 
-    log.info(f"=== Starting collection for instance: {name} ({hostname}) ===")
+    log.info(f"=== Starting Aria Operations collection: {name} ({hostname}) ===")
 
-    client = AriaClient(hostname, username, password, verify_ssl)
-
+    client = AriaOpsClient(hostname, username, password, auth_src, verify_ssl)
     try:
-        client.authenticate_vsphere()
+        client.authenticate()
     except Exception as e:
-        log.error(f"Authentication failed for {name}: {e}")
+        log.error(f"  Authentication failed: {e}")
         return
 
-    instance_id = upsert_instance(conn, name, hostname)
+    aria_id = upsert_aria_instance(conn, name, hostname)
 
-    # ── Datacenters ──
-    try:
-        datacenters = client.get_datacenters()
-        log.info(f"  Found {len(datacenters)} datacenters")
-    except Exception as e:
-        log.error(f"  Failed to fetch datacenters: {e}")
-        datacenters = []
+    # 1. vCenters — build UUID → DB ID map
+    log.info("  Collecting vCenters...")
+    vcenters = client.collect_vcenters()
+    vc_uuid_to_id = {}
+    for vc in vcenters:
+        vc_id = upsert_vcenter(conn, aria_id, vc)
+        vc_uuid_to_id[vc["aria_uuid"]] = vc_id
+    default_vc_id = next(iter(vc_uuid_to_id.values()), None)
 
+    # 2. Datacenters
+    log.info("  Collecting Datacenters...")
+    datacenters = client.collect_datacenters()
+    dc_uuid_to_id = {}
     for dc in datacenters:
-        dc_id = upsert_datacenter(conn, instance_id, dc)
+        vc_id = vc_uuid_to_id.get(dc.get("parent_vcenter_uuid"), default_vc_id)
+        if vc_id:
+            dc_id = upsert_datacenter(conn, vc_id, dc)
+            dc_uuid_to_id[dc["aria_uuid"]] = dc_id
+    default_dc_id = next(iter(dc_uuid_to_id.values()), None)
 
-        # ── Clusters ──
-        try:
-            clusters = client.get_clusters(dc["moref"])
-        except Exception as e:
-            log.warning(f"    Could not fetch clusters for DC {dc['name']}: {e}")
-            clusters = []
+    # 3. Clusters
+    log.info("  Collecting Clusters...")
+    clusters = client.collect_clusters()
+    cl_uuid_to_id = {}
+    for cl in clusters:
+        dc_id = dc_uuid_to_id.get(cl.get("parent_dc_uuid"), default_dc_id)
+        if dc_id:
+            cl_id = upsert_cluster(conn, dc_id, cl)
+            cl_uuid_to_id[cl["aria_uuid"]] = cl_id
+    default_cl_id = next(iter(cl_uuid_to_id.values()), None)
 
-        for cluster in clusters:
-            cluster_id = upsert_cluster(conn, dc_id, cluster)
+    # 4. Hosts
+    log.info("  Collecting Hosts...")
+    hosts = client.collect_hosts()
+    host_uuid_to_id = {}
+    for host in hosts:
+        cl_id = cl_uuid_to_id.get(host.get("parent_cluster_uuid"), default_cl_id)
+        if cl_id:
+            h_id = upsert_host(conn, cl_id, host)
+            host_uuid_to_id[host["aria_uuid"]] = h_id
+    default_host_id = next(iter(host_uuid_to_id.values()), None)
 
-            # ── Hosts ──
-            try:
-                hosts = client.get_hosts(cluster["moref"])
-            except Exception as e:
-                log.warning(f"      Could not fetch hosts for cluster {cluster['name']}: {e}")
-                hosts = []
+    # 5. VMs
+    log.info("  Collecting VMs...")
+    vms = client.collect_vms()
+    for vm in vms:
+        h_id = host_uuid_to_id.get(vm.get("parent_host_uuid"), default_host_id)
+        if h_id:
+            upsert_vm(conn, h_id, vm)
+    log.info(f"  VMs written: {len(vms)}")
 
-            for host in hosts:
-                host_id = upsert_host(conn, cluster_id, host)
+    # 6. Datastores
+    log.info("  Collecting Datastores...")
+    datastores = client.collect_datastores()
+    for ds in datastores:
+        vc_id = vc_uuid_to_id.get(ds.get("parent_vcenter_uuid"), default_vc_id)
+        if vc_id:
+            upsert_datastore(conn, vc_id, ds)
 
-                # ── VMs ──
-                try:
-                    vms = client.get_vms(host["moref"])
-                    for vm in vms:
-                        upsert_vm(conn, host_id, vm)
-                    log.info(f"        Host {host['name']}: {len(vms)} VMs")
-                except Exception as e:
-                    log.warning(f"        Could not fetch VMs for host {host['name']}: {e}")
-
-    # ── Datastores ──
-    try:
-        datastores = client.get_datastores()
-        for ds in datastores:
-            upsert_datastore(conn, instance_id, ds)
-        log.info(f"  Datastores: {len(datastores)}")
-    except Exception as e:
-        log.warning(f"  Could not fetch datastores: {e}")
-
-    # ── Networks ──
-    try:
-        networks = client.get_networks()
-        for net in networks:
-            upsert_network(conn, instance_id, net)
-        log.info(f"  Networks: {len(networks)}")
-    except Exception as e:
-        log.warning(f"  Could not fetch networks: {e}")
+    # 7. Networks
+    log.info("  Collecting Networks...")
+    networks = client.collect_networks()
+    for net in networks:
+        vc_id = vc_uuid_to_id.get(net.get("parent_vcenter_uuid"), default_vc_id)
+        if vc_id:
+            upsert_network(conn, vc_id, net)
 
     conn.commit()
-    update_last_synced(conn, instance_id)
+    with conn.cursor() as cur:
+        cur.execute("UPDATE aria_instances SET last_synced = %s WHERE id = %s",
+                    (datetime.utcnow(), aria_id))
     conn.commit()
-    log.info(f"=== Finished collection for: {name} ===\n")
+    client.release_token()
+    log.info(f"=== Finished: {name} ===\n")
 
 
-def load_config(path: str = "instances.yaml") -> list:
-    """Load vSphere instance definitions from YAML config."""
+def load_config(path="instances.yaml"):
     with open(path) as f:
-        cfg = yaml.safe_load(f)
-    return cfg.get("instances", [])
+        return yaml.safe_load(f).get("instances", [])
 
 
 def main():
     config_path = os.getenv("CONFIG_PATH", "instances.yaml")
-
     try:
         instances = load_config(config_path)
     except FileNotFoundError:
@@ -499,7 +651,7 @@ def main():
         try:
             collect_instance(conn, instance)
         except Exception as e:
-            log.error(f"Unhandled error for instance {instance.get('name')}: {e}")
+            log.error(f"Unhandled error for {instance.get('name')}: {e}")
             conn.rollback()
 
     conn.close()
