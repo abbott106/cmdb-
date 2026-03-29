@@ -1,0 +1,8 @@
+SELECT 
+    (SELECT COUNT(*) FROM vcenters)    AS vcenters,
+    (SELECT COUNT(*) FROM datacenters) AS datacenters,
+    (SELECT COUNT(*) FROM clusters)    AS clusters,
+    (SELECT COUNT(*) FROM hosts)       AS hosts,
+    (SELECT COUNT(*) FROM vms)         AS vms,
+    (SELECT COUNT(*) FROM datastores)  AS datastores,
+    (SELECT COUNT(*) FROM networks)    AS networks;
